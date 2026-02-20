@@ -204,6 +204,12 @@ struct DbInner {
 	cleanup_queue_wait: WaitCondvar<bool>,
 	iteration_lock: Mutex<()>,
 	last_enacted: AtomicU64,
+	commits_submitted: AtomicU64,
+	commits_enacted: AtomicU64,
+	user_commit_log_ids: Mutex<VecDeque<u64>>,
+	force_flush: AtomicBool,
+	enact_mutex: Mutex<()>,
+	enact_cv: Condvar,
 	next_reindex: AtomicU64,
 	bg_err: Mutex<Option<Arc<Error>>>,
 	db_version: u32,
@@ -289,6 +295,12 @@ impl DbInner {
 			iteration_lock: Mutex::new(()),
 			next_reindex: AtomicU64::new(1),
 			last_enacted: AtomicU64::new(last_enacted),
+			commits_submitted: AtomicU64::new(0),
+			commits_enacted: AtomicU64::new(0),
+			user_commit_log_ids: Mutex::new(VecDeque::new()),
+			force_flush: AtomicBool::new(false),
+			enact_mutex: Mutex::new(()),
+			enact_cv: Condvar::new(),
 			bg_err: Mutex::new(None),
 			db_version: metadata.version,
 			lock_file,
@@ -728,6 +740,7 @@ impl DbInner {
 		);
 		queue.commits.push_back(commit);
 		queue.bytes += bytes;
+		self.commits_submitted.fetch_add(1, Ordering::SeqCst);
 		self.log_worker_wait.signal();
 		Ok(())
 	}
@@ -953,6 +966,7 @@ impl DbInner {
 
 			let bytes = {
 				let bytes = self.log.end_record(l)?;
+				self.user_commit_log_ids.lock().push_back(record_id);
 				let mut logged_bytes = self.log_queue_wait.work.lock();
 				*logged_bytes += bytes as i64;
 				self.flush_worker_wait.signal();
@@ -1259,6 +1273,20 @@ impl DbInner {
 				let bytes = reader.read_bytes();
 				let cleared = reader.drain();
 				self.last_enacted.store(record_id, Ordering::SeqCst);
+				let is_user_commit = {
+					let mut ids = self.user_commit_log_ids.lock();
+					if ids.front() == Some(&record_id) {
+						ids.pop_front();
+						true
+					} else {
+						false
+					}
+				};
+				if is_user_commit {
+					self.commits_enacted.fetch_add(1, Ordering::SeqCst);
+					drop(self.enact_mutex.lock());
+					self.enact_cv.notify_all();
+				}
 				Some((record_id, cleared, bytes))
 			} else {
 				log::debug!(target: "parity-db", "End of log");
@@ -1695,7 +1723,8 @@ impl Db {
 			if !more_work {
 				db.flush_worker_wait.wait();
 			}
-			more_work = db.flush_logs(min_log_size)?;
+			let size = if db.force_flush.load(Ordering::SeqCst) { 0 } else { min_log_size };
+			more_work = db.flush_logs(size)?;
 		}
 		log::debug!(target: "parity-db", "Flush worker shutdown");
 		Ok(())
@@ -1817,6 +1846,47 @@ impl Db {
 
 		Column::drop_files(index, options.path.clone())?;
 		Ok(())
+	}
+
+	/// Force all pending work through the full pipeline (log, flush, enact)
+	/// and block until everything — including background reindex records —
+	/// has been applied to the backend tables. This bypasses the normal
+	/// flush-size threshold so even small writes are flushed immediately.
+	pub fn flush(&self) {
+		let target = self.inner.commits_submitted.load(Ordering::SeqCst);
+		if target == 0 {
+			return;
+		}
+		self.inner.force_flush.store(true, Ordering::SeqCst);
+		self.inner.flush_worker_wait.signal();
+
+		// Wait for all user commits to be enacted.
+		{
+			let mut lock = self.inner.enact_mutex.lock();
+			while self.inner.commits_enacted.load(Ordering::SeqCst) < target {
+				self.inner.enact_cv.wait(&mut lock);
+			}
+		}
+
+		// Drain remaining pipeline work (reindex records, etc.) so nothing
+		// accumulates in the WAL buffer between flush() calls.
+		loop {
+			let queue_empty = self.inner.commit_queue.lock().commits.is_empty();
+			let no_unflushed = !self.inner.log.has_unflushed_log();
+			let no_unread = !self.inner.log.has_log_files_to_read();
+			let not_reading = !self.inner.log.is_reading();
+			let no_reindex = self.inner.next_reindex.load(Ordering::SeqCst) == 0;
+			if queue_empty && no_unflushed && no_unread && not_reading && no_reindex {
+				break;
+			}
+			self.inner.log_worker_wait.signal();
+			self.inner.flush_worker_wait.signal();
+			self.inner.commit_worker_wait.signal();
+			self.inner.cleanup_worker_wait.signal();
+			std::thread::yield_now();
+		}
+
+		self.inner.force_flush.store(false, Ordering::SeqCst);
 	}
 
 	#[cfg(feature = "instrumentation")]
@@ -3588,5 +3658,44 @@ mod tests {
 
 		db.commit(payload.clone()).unwrap();
 		assert!(db.iter(1).is_ok());
+	}
+
+	#[test]
+	fn test_flush() {
+		let tmp = tempdir().unwrap();
+		let options = EnableCommitPipelineStages::Standard.options(tmp.path(), 1);
+		let db = Db::open_inner(&options, OpeningMode::Create).unwrap();
+
+		let payload: Vec<(u8, _, _)> = (0u16..100)
+			.map(|i| (0, i.to_le_bytes().to_vec(), Some(i.to_be_bytes().to_vec())))
+			.collect();
+
+		db.commit(payload.clone()).unwrap();
+
+		// Background threads are running but the default 64 MB flush
+		// threshold prevents the flush worker from making progress on our
+		// tiny payload. Give the threads time to be scheduled — the backend
+		// tables must still be empty.
+		std::thread::sleep(std::time::Duration::from_millis(100));
+
+		let mut count = 0u32;
+		db.iter_column_while(0, |_| {
+			count += 1;
+			true
+		})
+		.unwrap();
+		assert_eq!(count, 0, "data must not reach backend tables without flush");
+
+		// flush() forces the data through the pipeline regardless of the
+		// size threshold and blocks until enactment is complete.
+		db.flush();
+
+		let mut count = 0u32;
+		db.iter_column_while(0, |_| {
+			count += 1;
+			true
+		})
+		.unwrap();
+		assert_eq!(count, 100, "flush must enact all commits to backend tables");
 	}
 }

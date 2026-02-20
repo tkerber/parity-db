@@ -1043,6 +1043,18 @@ impl Log {
 		self.read_queue.read().len() > 0
 	}
 
+	pub fn has_unflushed_log(&self) -> bool {
+		self.appending.read().as_ref().map_or(false, |r| r.size > 0)
+	}
+
+	pub fn is_reading(&self) -> bool {
+		match self.reading.try_read() {
+			Some(guard) => guard.is_some(),
+			// Write lock held means the commit worker is actively processing.
+			None => true,
+		}
+	}
+
 	pub fn kill_logs(&self) -> Result<()> {
 		let mut log_pool = self.log_pool.write();
 		for (id, file) in log_pool.drain(..) {
